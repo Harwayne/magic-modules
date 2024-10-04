@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,6 +294,64 @@ func BootstrapSharedTestADDomain(t *testing.T, testId string, networkName string
 	}
 
 	return sharedADDomain
+}
+
+// bootstrapOnce is a helper that allows multiple tests to call the same bootstrapping function at
+// the same time, while it will only actually run once. Any side effects it has will be applied to
+// the *testing.T of all callers.
+//
+// Example:
+//
+//	 var bootstrapFooOnce = createBootstrapOnce[string]()
+//
+//		func BootstrapFoo(project string, t *testing.T) string {
+//		    return bootstrapFooOnce.run(
+//		        project,
+//		        t,
+//		        createFoo(project))
+//		}
+//
+//		func createFoo(project string) func() (func(*testing.T), string) {
+//		    v, err := foopkg.Create(project)
+//		    if err != nil {
+//		        return func(t *testing.T) {
+//		            t.Fatalf("failed to create foo: %v", err)
+//		        }, ""
+//		    }
+//		    return v
+//		}
+type bootstrapOnce[Value any] struct {
+	holder *sync.Map
+}
+
+type bootstrapOnceValue[Value any] struct {
+	once   *sync.Once
+	tFunc  func(*testing.T)
+	result Value
+}
+
+func createBootstrapOnce[Value any]() *bootstrapOnce[Value] {
+	return &bootstrapOnce[Value]{
+		holder: &sync.Map{},
+	}
+}
+
+// Runs the bootstrapping code in f the first time for each unique key. For all other calls with
+// that key, it will wait until f is complete. All callers with that key will have t called on the
+// output of f and this function will return the second output of f.
+func (b *bootstrapOnce[Value]) run(key string, t *testing.T, f func() (func(*testing.T), Value)) Value {
+	value, _ := b.holder.LoadOrStore(key, &bootstrapOnceValue[Value]{
+		once:  &sync.Once{},
+		tFunc: func(*testing.T) {},
+	})
+	v := value.(*bootstrapOnceValue[Value])
+	v.once.Do(func() {
+		v.tFunc, v.result = f()
+	})
+	if v.tFunc != nil {
+		v.tFunc(t)
+	}
+	return v.result
 }
 
 const SharedTestNetworkPrefix = "tf-bootstrap-net-"
@@ -1064,8 +1123,9 @@ func BootstrapNetworkAttachment(t *testing.T, networkAttachmentName string, subn
 // internally as part of their configuration or this will just hang.
 const SharedTestFirewallPrefix = "tf-bootstrap-firewall-"
 
+var bootstrapFirewallForDataprocSharedNetworkOnce = createBootstrapOnce[string]()
+
 func BootstrapFirewallForDataprocSharedNetwork(t *testing.T, firewallName string, networkName string) string {
-	project := envvar.GetTestProjectFromEnv()
 	firewallName = SharedTestFirewallPrefix + firewallName
 
 	config := BootstrapConfig(t)
@@ -1073,61 +1133,78 @@ func BootstrapFirewallForDataprocSharedNetwork(t *testing.T, firewallName string
 		return ""
 	}
 
-	log.Printf("[DEBUG] Getting Firewall %q for Network %q", firewallName, networkName)
-	_, err := config.NewComputeClient(config.UserAgent).Firewalls.Get(project, firewallName).Do()
-	if err != nil && transport_tpg.IsGoogleApiErrorWithCode(err, 404) {
-		log.Printf("[DEBUG] firewallName %q not found, bootstrapping", firewallName)
-		url := fmt.Sprintf("%sprojects/%s/global/firewalls", config.ComputeBasePath, project)
+	return bootstrapFirewallForDataprocSharedNetworkOnce.run(
+		fmt.Sprintf("%s @ %s", networkName, firewallName),
+		t,
+		bootstrapFirewallForDataprocSharedNetworkFunction(config, firewallName, networkName))
+}
 
-		networkId := fmt.Sprintf("projects/%s/global/networks/%s", project, networkName)
-		allowObj := []interface{}{
-			map[string]interface{}{
-				"IPProtocol": "icmp",
-			},
-			map[string]interface{}{
-				"IPProtocol": "tcp",
-				"ports":      []string{"0-65535"},
-			},
-			map[string]interface{}{
-				"IPProtocol": "udp",
-				"ports":      []string{"0-65535"},
-			},
+func bootstrapFirewallForDataprocSharedNetworkFunction(config *transport_tpg.Config, firewallName, networkName string) func() (func(*testing.T), string) {
+	return func() (func(*testing.T), string) {
+		log.Printf("[DEBUG] Getting Firewall %q for Network %q", firewallName, networkName)
+		_, err := config.NewComputeClient(config.UserAgent).Firewalls.Get(config.Project, firewallName).Do()
+		if err != nil && transport_tpg.IsGoogleApiErrorWithCode(err, 404) {
+			log.Printf("[DEBUG] firewallName %q not found, bootstrapping", firewallName)
+			url := fmt.Sprintf("%sprojects/%s/global/firewalls", config.ComputeBasePath, config.Project)
+
+			networkId := fmt.Sprintf("projects/%s/global/networks/%s", config.Project, networkName)
+			allowObj := []interface{}{
+				map[string]interface{}{
+					"IPProtocol": "icmp",
+				},
+				map[string]interface{}{
+					"IPProtocol": "tcp",
+					"ports":      []string{"0-65535"},
+				},
+				map[string]interface{}{
+					"IPProtocol": "udp",
+					"ports":      []string{"0-65535"},
+				},
+			}
+
+			firewallObj := map[string]interface{}{
+				"name":    firewallName,
+				"network": networkId,
+				"allowed": allowObj,
+			}
+
+			res, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+				Config:    config,
+				Method:    "POST",
+				Project:   config.Project,
+				RawURL:    url,
+				UserAgent: config.UserAgent,
+				Body:      firewallObj,
+				Timeout:   4 * time.Minute,
+			})
+			if err != nil {
+				return func(innerT *testing.T) {
+					innerT.Fatalf("Error bootstrapping Firewall %q for Network %q: %s", firewallName, networkName, err)
+				}, ""
+			}
+
+			log.Printf("[DEBUG] Waiting for Firewall creation to finish")
+			err = tpgcompute.ComputeOperationWaitTime(config, res, config.Project, "Error bootstrapping Firewall", config.UserAgent, 4*time.Minute)
+			if err != nil {
+				return func(innerT *testing.T) {
+					innerT.Fatalf("Error bootstrapping Firewall %q: %s", firewallName, err)
+				}, ""
+			}
 		}
 
-		firewallObj := map[string]interface{}{
-			"name":    firewallName,
-			"network": networkId,
-			"allowed": allowObj,
-		}
-
-		res, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
-			Config:    config,
-			Method:    "POST",
-			Project:   project,
-			RawURL:    url,
-			UserAgent: config.UserAgent,
-			Body:      firewallObj,
-			Timeout:   4 * time.Minute,
-		})
+		firewall, err := config.NewComputeClient(config.UserAgent).Firewalls.Get(config.Project, firewallName).Do()
 		if err != nil {
-			t.Fatalf("Error bootstrapping Firewall %q for Network %q: %s", firewallName, networkName, err)
+			return func(innerT *testing.T) {
+				innerT.Errorf("Error getting Firewall %q: %s", firewallName, err)
+			}, ""
 		}
-
-		log.Printf("[DEBUG] Waiting for Firewall creation to finish")
-		err = tpgcompute.ComputeOperationWaitTime(config, res, project, "Error bootstrapping Firewall", config.UserAgent, 4*time.Minute)
-		if err != nil {
-			t.Fatalf("Error bootstrapping Firewall %q: %s", firewallName, err)
+		if firewall == nil {
+			return func(innerT *testing.T) {
+				innerT.Fatalf("Error getting Firewall %q: is nil", firewallName)
+			}, ""
 		}
+		return nil, firewall.Name
 	}
-
-	firewall, err := config.NewComputeClient(config.UserAgent).Firewalls.Get(project, firewallName).Do()
-	if err != nil {
-		t.Errorf("Error getting Firewall %q: %s", firewallName, err)
-	}
-	if firewall == nil {
-		t.Fatalf("Error getting Firewall %q: is nil", firewallName)
-	}
-	return firewall.Name
 }
 
 const SharedStoragePoolPrefix = "tf-bootstrap-storage-pool-"
